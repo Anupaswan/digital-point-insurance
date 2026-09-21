@@ -1,8 +1,7 @@
-
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,19 +15,41 @@ if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
   process.exit(1);
 }
 
-const DATA_DIR = path.join(__dirname, 'data');
-const LEADS_FILE = path.join(DATA_DIR, 'leads.json');
+// --------------------
+// Database Setup (PostgreSQL)
+// --------------------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-if (!fs.existsSync(LEADS_FILE)) {
-  fs.writeFileSync(LEADS_FILE, '[]');
+// Auto-create inquiries table
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS inquiries (
+        id VARCHAR(50) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        phone VARCHAR(30) NOT NULL,
+        vehicle_type VARCHAR(60) NOT NULL,
+        service VARCHAR(100) NOT NULL,
+        message TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('PostgreSQL inquiries table is ready.');
+  } catch (err) {
+    console.error('Error initializing database table:', err);
+  }
 }
+initDB();
 
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Never expose private files or the leads database publicly.
+// Never expose private files publicly.
 app.use((req, res, next) => {
   const blockedPaths = [
     '/data',
@@ -158,7 +179,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.post('/api/inquiries', (req, res) => {
+app.post('/api/inquiries', async (req, res) => {
   const { name, phone, vehicleType, service, message } = req.body || {};
 
   if (!name || !phone || !vehicleType || !service) {
@@ -177,47 +198,31 @@ app.post('/api/inquiries', (req, res) => {
     });
   }
 
-  let leads;
+  const leadId = `DP-${Date.now()}`;
+  const cleanName = String(name).trim().slice(0, 100);
+  const cleanVehicle = String(vehicleType).trim().slice(0, 60);
+  const cleanService = String(service).trim().slice(0, 100);
+  const cleanMessage = String(message || '').trim().slice(0, 1000);
 
   try {
-    leads = JSON.parse(fs.readFileSync(LEADS_FILE, 'utf8'));
+    await pool.query(
+      `INSERT INTO inquiries (id, name, phone, vehicle_type, service, message)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [leadId, cleanName, cleanPhone.slice(0, 30), cleanVehicle, cleanService, cleanMessage]
+    );
 
-    if (!Array.isArray(leads)) {
-      leads = [];
-    }
-  } catch (error) {
-    return res.status(500).json({
-      ok: false,
-      message: 'Unable to read inquiry data.'
+    res.status(201).json({
+      ok: true,
+      message: 'Your inquiry was submitted successfully.',
+      inquiryId: leadId
     });
-  }
-
-  const lead = {
-    id: `DP-${Date.now()}`,
-    name: String(name).trim().slice(0, 100),
-    phone: cleanPhone.slice(0, 30),
-    vehicleType: String(vehicleType).trim().slice(0, 60),
-    service: String(service).trim().slice(0, 100),
-    message: String(message || '').trim().slice(0, 1000),
-    createdAt: new Date().toISOString()
-  };
-
-  leads.push(lead);
-
-  try {
-    fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
   } catch (error) {
-    return res.status(500).json({
+    console.error('Database insert error:', error);
+    res.status(500).json({
       ok: false,
       message: 'Unable to save inquiry.'
     });
   }
-
-  res.status(201).json({
-    ok: true,
-    message: 'Your inquiry was submitted successfully.',
-    inquiryId: lead.id
-  });
 });
 
 // --------------------
@@ -276,15 +281,27 @@ app.post('/api/admin/logout', (req, res) => {
 // Protected inquiry API
 // --------------------
 
-app.get('/api/admin/inquiries', requireAdmin, (req, res) => {
+app.get('/api/admin/inquiries', requireAdmin, async (req, res) => {
   try {
-    const leads = JSON.parse(fs.readFileSync(LEADS_FILE, 'utf8'));
+    const result = await pool.query(
+      `SELECT 
+        id, 
+        name, 
+        phone, 
+        vehicle_type AS "vehicleType", 
+        service, 
+        message, 
+        created_at AS "createdAt"
+       FROM inquiries 
+       ORDER BY created_at DESC`
+    );
 
     res.json({
       ok: true,
-      inquiries: Array.isArray(leads) ? leads.reverse() : []
+      inquiries: result.rows
     });
   } catch (error) {
+    console.error('Database fetch error:', error);
     res.status(500).json({
       ok: false,
       message: 'Unable to load inquiries.'
